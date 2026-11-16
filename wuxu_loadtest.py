@@ -6,7 +6,7 @@ from __future__ import annotations
 DEFAULT_USERS = 30
 DEFAULT_DURATION_SECONDS = 300
 DEFAULT_BASE_URL = "https://wuxu.ru"
-DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_MODEL = "pilot-model"
 
 import argparse
 import asyncio
@@ -26,6 +26,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from uuid import uuid4
+from log_files import FileManager, generate_only, parse_sizes
 
 try:
     import httpx
@@ -56,6 +57,8 @@ FIELDS = [
     "http_status", "ok", "elapsed_ms", "headers_ms", "ttft_ms", "output_chars",
     "prompt_tokens", "completion_tokens", "total_tokens", "finish_reason",
     "error_kind", "error", "retry_after_s",
+    "chat_sent", "file_id", "file_bytes", "generation_ms", "upload_ms", "processing_ms",
+    "workflow_ms", "attachment_verified",
 ]
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -154,7 +157,7 @@ async def completion(client, cfg, key, payload, identity, secrets):
             async with client.stream(
                 "POST", cfg.base_url + "/api/chat/completions", json=payload,
                 headers={"Authorization": "Bearer " + key,
-                         "User-Agent": "wuxu-loadtest/1.0", "Accept": "text/event-stream, application/json"},
+                         "User-Agent": "wuxu-loadtest/1.1", "Accept": "text/event-stream, application/json"},
             ) as response:
                 row["headers_ms"] = round((time.perf_counter() - start) * 1000, 3)
                 row["http_status"] = response.status_code
@@ -309,7 +312,7 @@ class Recorder:
         self.csvfile.close()
 
 
-async def run_load(client, cfg, keys, prompts, run_id, record, stop):
+async def run_load(client, cfg, keys, prompts, run_id, record, stop, files=None):
     start = time.perf_counter()
     deadline = start + cfg.duration
     state = dict(issued=0, inflight=0, peak=0, consecutive_errors=0, reason="duration")
@@ -328,6 +331,7 @@ async def run_load(client, cfg, keys, prompts, run_id, record, stop):
         key_index = index % len(keys)
         identity = {"user_id": f"vu-{index + 1:03}", "credential_id": f"key-{key_index + 1:03}"}
         history = []
+        attachment, marker, dialogs = None, None, 0
         await pause(cfg.ramp_up * index / max(1, cfg.users - 1))
         while not stop.is_set() and time.perf_counter() < deadline:
             # No await between checking and reserving: atomic in this event loop.
@@ -342,21 +346,57 @@ async def run_load(client, cfg, keys, prompts, run_id, record, stop):
                 stop.set()  # Finish this last reserved request and drain other in-flight ones.
             if len(history) >= cfg.turns * 2:
                 history = []
+            workflow_start = time.perf_counter()
+            new_file = None
+            if not history:
+                attachment, marker = None, None
+                if files and dialogs % cfg.log_every_dialogs == 0 and files.available():
+                    new_file, marker = await files.prepare(key_index, identity["user_id"], index + dialogs)
+                    if new_file["ok"]:
+                        attachment = new_file
+                dialogs += 1
             turn = len(history) // 2
             scenario = rng.randrange(len(prompts)) if not history else -1
             prompt = prompts[scenario] if not history else FOLLOWUPS[(turn - 1) % len(FOLLOWUPS)]
+            if attachment and not history:
+                prompt = ("Проанализируй прикреплённый log-файл. Найди примеры DB_POOL_TIMEOUT, HTTP 503 "
+                          "и UPSTREAM_RETRY. Кратко опиши наблюдения и предложи проверки. "
+                          "Не выдавай найденные фрагменты за статистику всего файла.")
+                if marker and cfg.verify_file:
+                    prompt += " Найди в файле поле WUXU_CHECK и обязательно приведи его значение целиком, без изменений."
             request_id = f"{run_id}-{identity['user_id']}-{sequence:06}"
             prompt += f"\nИдентификатор тестового запроса: {request_id}. Не включай его в ответ."
             message = {"role": "user", "content": prompt}
             payload = make_payload(cfg, history + [message])
+            if attachment:
+                payload["files"] = [{"type": "file", "id": attachment["file_id"]}]
             current = dict(identity, request_id=request_id, scenario=f"prompt-{scenario + 1}" if scenario >= 0 else "followup",
-                           offset_s=round(time.perf_counter() - start, 3))
-            state["inflight"] += 1
-            state["peak"] = max(state["peak"], state["inflight"])
-            try:
-                row, answer = await completion(client, cfg, keys[key_index], payload, current, keys)
-            finally:
-                state["inflight"] -= 1
+                           offset_s=round(workflow_start - start, 3))
+            if new_file and not new_file["ok"]:
+                row = dict.fromkeys(FIELDS)
+                row.update(current, started_utc=utcnow(), ok=False, output_chars=0,
+                           http_status=new_file["http_status"], error_kind=new_file["error_kind"],
+                           error=new_file["error"], retry_after_s=new_file["retry_after_s"], chat_sent=False)
+                answer = ""
+            else:
+                state["inflight"] += 1
+                state["peak"] = max(state["peak"], state["inflight"])
+                try:
+                    row, answer = await completion(client, cfg, keys[key_index], payload, current, keys)
+                    row["chat_sent"] = True
+                finally:
+                    state["inflight"] -= 1
+            if new_file or attachment:
+                attached = new_file or attachment
+                row.update(file_id=attached["file_id"], file_bytes=attached["bytes"], scenario="file-chat" if not history else "file-followup")
+                if new_file:
+                    row.update({name: new_file[name] for name in ("generation_ms", "upload_ms", "processing_ms")})
+                if new_file and new_file["ok"] and marker and cfg.verify_file and row["ok"]:
+                    row["attachment_verified"] = marker in answer
+                    if not row["attachment_verified"]:
+                        row.update(ok=False, error_kind="file_content_not_verified",
+                                   error="Модель не вернула WUXU_CHECK из файла. Проверьте RAG/Preload Files у модели.")
+            row["workflow_ms"] = round((time.perf_counter() - workflow_start) * 1000, 3)
             record.add(row)
             if row["ok"]:
                 # Bound retained history even if a provider ignores max_output_tokens.
@@ -366,8 +406,10 @@ async def run_load(client, cfg, keys, prompts, run_id, record, stop):
                 state["consecutive_errors"] += 1
                 if row["error_kind"] == "cancelled":
                     stop.set()
-                if row["http_status"] in (401, 403):
+                if row["http_status"] in (401, 403, 413):
                     state["reason"] = "authentication_or_permission_error"
+                    if row["http_status"] == 413:
+                        state["reason"] = "file_too_large"
                     stop.set()
                 elif cfg.stop_after_errors and state["consecutive_errors"] >= cfg.stop_after_errors:
                     state["reason"] = "consecutive_errors"
@@ -382,6 +424,9 @@ async def run_load(client, cfg, keys, prompts, run_id, record, stop):
                 ok = sum(r["ok"] for r in record.rows)
                 print(f"{time.perf_counter()-start:6.1f}s  requests={len(record.rows)}  "
                       f"ok={ok}  errors={len(record.rows)-ok}  active_requests={state['inflight']}", flush=True)
+                if files:
+                    print(f"  files={len(files.entries)}  accepted={sum(e['upload_accepted'] for e in files.entries)}  "
+                          f"processed={sum(e['ok'] for e in files.entries)}", flush=True)
             # Propagate unexpected programming errors instead of silently losing a worker.
             for task in tasks:
                 if task.done() and not task.cancelled() and task.exception():
@@ -396,7 +441,11 @@ async def run_load(client, cfg, keys, prompts, run_id, record, stop):
     elapsed = time.perf_counter() - start
     if stop.is_set() and state["reason"] == "duration":
         state["reason"] = "operator_stop"
-    return summarize(record.rows, elapsed, len(keys), cfg.users, state["peak"], state["reason"])
+    summary = summarize(record.rows, elapsed, len(keys), cfg.users, state["peak"], state["reason"])
+    summary.update(chat_posts=sum(bool(r.get("chat_sent")) for r in record.rows),
+                   workflow_success_ms=distribution([r.get("workflow_ms") for r in record.rows if r["ok"]]),
+                   verified_file_answers=sum(r.get("attachment_verified") is True for r in record.rows))
+    return summary
 
 
 def write_report(directory, summary, cfg, probe):
@@ -408,28 +457,36 @@ def write_report(directory, summary, cfg, probe):
     lines = ["# WUXU — результат нагрузочного теста", "",
              f"- Endpoint: {cfg.base_url}/api/chat/completions",
              f"- Модель: `{cfg.model}`", f"- Пользователи: {cfg.users}; разных ключей: {summary['distinct_credentials']}",
-             f"- Плановое окно запуска запросов: {cfg.duration} с; с ожиданием ответов: {summary['elapsed_seconds_including_drain']} с",
+             f"- Плановое окно начала сценариев: {cfg.duration} с; с ожиданием их завершения: {summary['elapsed_seconds_including_drain']} с",
              f"- Завершение: {summary['stop_reason']}",
-             f"- Запросы нагрузки: {summary['requests']}; успешно: {summary['successful']}; ошибок: {summary['failed']}",
+             f"- Сценарии нагрузки: {summary['requests']}; успешно: {summary['successful']}; ошибок: {summary['failed']}",
              f"- Ошибок: {metric(summary['error_rate_percent'])}%",
              f"- Пиковое число одновременных запросов: {summary['peak_inflight_requests']}",
              f"- Успешных запросов/с (включая ожидание последних ответов): {summary['successful_requests_per_second']}", "",
              "| Метрика, мс — успешные запросы | p50 | p95 | p99 | max |",
              "|---|---:|---:|---:|---:|"]
-    for title, values in (("Полный ответ", latency), ("Первый видимый текст (TTFT)", ttft)):
+    for title, values in (("Полный ответ от chat POST", latency), ("Первый видимый текст (TTFT)", ttft),
+                          ("Сценарий целиком", summary.get("workflow_success_ms", distribution([])))):
         lines.append("| " + title + " | " + " | ".join(metric(values[x]) for x in ("p50", "p95", "p99", "max")) + " |")
     lines += ["", f"Токены получены для {summary['usage_reported_requests']} из {summary['requests']} запросов нагрузки.",
               "Отсутствующие usage не считаются нулевым расходом. Известные суммы: " + json.dumps(summary["reported_tokens_only"]),
               f"Ответов с finish_reason=length: {summary['length_limited_responses']}.",
               "Пробный POST до нагрузки приведён отдельно в summary.json; он также расходует токены.",
               "Расход денег проверяйте в LiteLLM: оценки стоимости в этом отчёте нет.", "",
-              "Это тест API инференса с паузами и ограниченной историей диалога. Он не проверяет браузер, вход/2FA, "
-              "загрузку файлов, RAG или сохранение чатов. Один ключ означает одну учётную запись.", "",
+              f"Chat POST нагрузки: {summary.get('chat_posts', summary['requests'])}. Ошибка загрузки не запускает chat POST.",
+              "Это тест API с паузами, историей и опциональной загрузкой файлов/RAG. Он не проверяет браузер, вход/2FA "
+              "или сохранение чатов. Один ключ означает одну учётную запись.", "",
               "При росте задержек пользователи этого теста ждут ответа, поэтому поток новых запросов снижается "
               "(closed-loop). Результат не определяет максимальный RPS системы.", ""]
     errors = Counter((r["error_kind"], r["error"]) for r in getattr(cfg, "error_rows", []))
     for (kind, message), count in errors.most_common(5):
         lines.append(f"- {count} × {kind}: {message}")
+    if "files" in summary:
+        lines += ["", "## Файлы", "", "```json", json.dumps(summary["files"], ensure_ascii=False, indent=2), "```",
+                  "Время workflow включает генерацию, загрузку, ожидание обработки и ответ модели. "
+                  "Обычные latency/TTFT отсчитываются от chat POST. files.json содержит ID и результат очистки.",
+                  "Проверка WUXU_CHECK подтверждает получение фрагмента файла, а не прочтение всех строк. "
+                  "Токены embeddings в статистику ответов чата не входят."]
     (directory / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -456,7 +513,19 @@ def parse_args(argv=None):
     parser.add_argument("--no-usage", action="store_false", dest="include_usage", default=True)
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--smoke", action="store_true", help="2 пользователя, 20 с, максимум 4 POST включая пробный")
+    parser.add_argument("--smoke", action="store_true", help="2 пользователя, 20 с, максимум 3 сценария + 1 пробный chat POST")
+    parser.add_argument("--upload-logs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-sizes-mb", default="1")
+    parser.add_argument("--log-files", nargs="+", type=Path, default=[])
+    parser.add_argument("--log-every-dialogs", type=int, default=1)
+    parser.add_argument("--max-uploads", type=int, default=30, help="0 = без ограничения; иначе общий лимит файлов")
+    parser.add_argument("--upload-timeout", type=float, default=300)
+    parser.add_argument("--processing-timeout", type=float, default=600)
+    parser.add_argument("--file-poll-interval", type=float, default=2)
+    parser.add_argument("--cleanup-files", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--verify-file", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generate-only", action="store_true", help="Создать реальные .log локально; без ключа/сети")
+    parser.add_argument("--log-dir", type=Path, default=Path("generated-logs"))
     args = parser.parse_args(argv)
     args.base_url = args.base_url.rstrip("/")
     url = httpx.URL(args.base_url)
@@ -479,6 +548,17 @@ def parse_args(argv=None):
         parser.error("max-requests: 0 или >=2; stop-after-errors >=0; turns и max-output-tokens >=1")
     if not args.model.strip() and not args.list_models:
         parser.error("Укажите --model (точный ID модели Open WebUI)")
+    try:
+        args.log_sizes_bytes = parse_sizes(args.log_sizes_mb)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.log_every_dialogs < 1 or args.max_uploads < 0:
+        parser.error("log-every-dialogs >= 1; max-uploads >= 0")
+    if any(not math.isfinite(v) or v <= 0 for v in (args.upload_timeout, args.processing_timeout, args.file_poll_interval)):
+        parser.error("Таймауты файлов и file-poll-interval должны быть конечными числами > 0")
+    for path in args.log_files:
+        if not path.is_file() or path.stat().st_size == 0 or path.suffix.lower() != ".log":
+            parser.error(f"Нужен существующий непустой .log: {path}")
     return args
 
 
@@ -528,10 +608,14 @@ async def main_async(cfg, keys):
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, on_signal)
         probe = None
+        files = FileManager(client, cfg, keys, directory, redact) if cfg.upload_logs else None
         try:
             settings = {k: getattr(cfg, k) for k in (
                 "base_url", "model", "users", "duration", "ramp_up", "think_min", "think_max", "timeout",
-                "max_output_tokens", "token_limit_param", "max_requests", "turns", "stop_after_errors", "stream", "include_usage", "seed")}
+                "max_output_tokens", "token_limit_param", "max_requests", "turns", "stop_after_errors", "stream", "include_usage", "seed",
+                "upload_logs", "log_sizes_bytes", "log_every_dialogs", "max_uploads", "upload_timeout", "processing_timeout",
+                "file_poll_interval", "cleanup_files", "verify_file")}
+            settings["log_files"] = [str(p) for p in cfg.log_files]
             settings.update(run_id=run_id, distinct_credentials=len(keys), created_utc=utcnow())
             (directory / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"Endpoint: {cfg.base_url}/api/chat/completions\nModel: {cfg.model}\n"
@@ -550,7 +634,23 @@ async def main_async(cfg, keys):
             if not probe["ok"]:
                 print("Пробный запрос не прошёл; нагрузка не запущена: " + probe["error"], file=sys.stderr)
                 return 2
-            summary = await run_load(client, cfg, keys, prompts, run_id, record, stop)
+            if files:
+                print(f"Files: sizes={cfg.log_sizes_mb} MB; own_files={len(cfg.log_files)}; max_uploads={cfg.max_uploads}; "
+                      f"cleanup={cfg.cleanup_files}. Начатый сценарий завершается целиком, даже после окна нагрузки.", flush=True)
+            summary = await run_load(client, cfg, keys, prompts, run_id, record, stop, files)
+            if files:
+                print("Завершаю обработку отчёта и очистку файлов этого запуска...", flush=True)
+                await files.cleanup()
+                entries = files.entries
+                summary["files"] = {
+                    "attempts": len(entries), "accepted": sum(e["upload_accepted"] for e in entries),
+                    "processed": sum(e["ok"] for e in entries), "failed": sum(not e["ok"] for e in entries),
+                    "accepted_file_bytes": sum(e["bytes"] for e in entries if e["upload_accepted"]),
+                    "upload_ms": distribution([e["upload_ms"] for e in entries if e["upload_accepted"]]),
+                    "processing_ms": distribution([e["processing_ms"] for e in entries if e["ok"]]),
+                    "cleanup": dict(Counter(e["cleanup"] for e in entries)),
+                    "cleanup_errors": sum(e["cleanup"] == "failed" for e in entries),
+                }
             cfg.error_rows = [r for r in record.rows if not r["ok"]]
             write_report(directory, summary, cfg, probe)
             print(json.dumps({k: summary[k] for k in ("requests", "successful", "failed", "stop_reason",
@@ -558,8 +658,10 @@ async def main_async(cfg, keys):
             print(f"Отчёт: {(directory / 'report.md').resolve()}")
             if summary["stop_reason"] == "operator_stop":
                 return 130
-            return 0 if summary["requests"] > 0 and summary["failed"] == 0 else 1
+            return 0 if summary["requests"] > 0 and summary["failed"] == 0 and not summary.get("files", {}).get("cleanup_errors") else 1
         finally:
+            if files:
+                files.close()
             record.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
@@ -571,11 +673,13 @@ def main(argv=None):
     os.umask(0o077)
     cfg = parse_args(argv)
     if cfg.dry_run:
-        print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in vars(cfg).items()}, ensure_ascii=False, indent=2))
+        print(json.dumps(vars(cfg), ensure_ascii=False, indent=2, default=str))
         print("Dry run: сетевых запросов не было; ключ не требуется.")
         return 0
     keys = []
     try:
+        if cfg.generate_only:
+            return generate_only(cfg)
         keys = read_keys(cfg)
         return asyncio.run(main_async(cfg, keys))
     except KeyboardInterrupt:

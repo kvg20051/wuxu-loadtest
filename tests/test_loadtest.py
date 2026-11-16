@@ -7,11 +7,13 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("wuxu_loadtest", ROOT / "wuxu_loadtest.py")
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
